@@ -1,0 +1,983 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+英語音声→日本語字幕生成ツール（WAV専用・FFmpeg不要版）
+English Speech to Japanese Subtitle Generator (WAV Only)
+
+WAVファイルのみ対応、FFmpegとpydub不要
+作者: yukiko (AI・BIエンジニア転職活動中)
+"""
+
+# 標準ライブラリのインポート
+import os          # ファイル・ディレクトリ操作用
+import sys         # システム関連の操作用
+from datetime import datetime, timedelta  # 日時操作用
+
+# 必要なライブラリのインポートを安全に行う
+# try-except文で囲むことで、ライブラリが不足していてもエラーで止まらない
+try:
+    import json                             # JSON形式のデータ処理用（使用予定）
+    import threading                        # マルチスレッド処理用（GUI応答性向上）
+    import tkinter as tk                    # GUI作成用メインライブラリ
+    from tkinter import filedialog, messagebox, scrolledtext, ttk  # GUI部品
+    from openai import OpenAI               # OpenAI API連携用
+    import wave                             # WAVファイル処理用
+    import configparser                     # 設定ファイル読み書き用
+    import re                               # 正規表現処理用（使用予定）
+    IMPORTS_OK = True                       # インポート成功フラグ
+    MISSING_MODULE = ""                     # エラーメッセージ格納用
+except ImportError as e:                    # インポートエラーが発生した場合
+    IMPORTS_OK = False                      # インポート失敗フラグ
+    MISSING_MODULE = str(e)                 # エラーメッセージを文字列で保存
+
+class EnglishToJapaneseSubtitle:
+    """
+    英語音声を日本語字幕に変換するメインクラス
+    OpenAI APIを使用して音声認識と翻訳を行う
+    """
+    
+    def __init__(self, api_key=None):
+        """
+        クラスの初期化メソッド
+        Args:
+            api_key: OpenAI APIキー（オプション）
+        """
+        # インポートが失敗していた場合は処理を中断
+        if not IMPORTS_OK:
+            return
+        
+        # OpenAI APIクライアントを初期化（最初はNone）
+        self.client = None
+        
+        # APIキーが渡されていれば設定する
+        if api_key:
+            self.set_api_key(api_key)
+    
+    def set_api_key(self, api_key):
+        """
+        OpenAI APIキーを設定し、接続をテストする
+        Args:
+            api_key: OpenAI APIキー
+        Returns:
+            bool: 設定成功時True、失敗時False
+        """
+        try:
+            # OpenAIクライアントを初期化
+            self.client = OpenAI(api_key=api_key)  # APIキーを設定
+            
+            # APIキーの有効性をテスト（モデル一覧を取得）
+            self.client.models.list()              # 実際にAPIを呼び出してテスト
+            return True                             # 成功時はTrueを返す
+        except Exception as e:                      # エラーが発生した場合
+            print(f"APIキー設定エラー: {e}")        # エラー内容をコンソールに出力
+            self.client = None                      # クライアントをリセット
+            return False                            # 失敗時はFalseを返す
+    
+    def validate_wav_file(self, wav_file):
+        """
+        WAVファイルの妥当性をチェックする
+        ファイル形式、サイズ、音質などを確認
+        Args:
+            wav_file: WAVファイルのパス
+        Returns:
+            tuple: (成功フラグ, メッセージ)
+        """
+        try:
+            # WAVファイルを読み込みモードで開く
+            with wave.open(wav_file, 'rb') as wf:   # 'rb'はバイナリ読み込みモード
+                # ファイル情報を取得
+                channels = wf.getnchannels()        # チャンネル数（モノラル=1、ステレオ=2）
+                sample_width = wf.getsampwidth()    # サンプル幅（バイト数）
+                framerate = wf.getframerate()       # サンプルレート（Hz）
+                frames = wf.getnframes()            # 総フレーム数
+                duration = frames / float(framerate)  # 長さを秒で計算
+                
+                # ファイル情報をコンソールに出力（デバッグ用）
+                print(f"WAVファイル情報:")
+                print(f"  チャンネル数: {channels}")           # 1=モノラル, 2=ステレオ
+                print(f"  サンプル幅: {sample_width} bytes")   # 通常は2バイト（16bit）
+                print(f"  サンプルレート: {framerate} Hz")     # 音質を決める重要な値
+                print(f"  長さ: {duration:.2f} 秒")            # 小数点以下2桁で表示
+                
+                # ファイルサイズチェック（OpenAI APIの制限は25MB）
+                file_size = os.path.getsize(wav_file)           # ファイルサイズを取得（バイト）
+                if file_size > 25 * 1024 * 1024:                # 25MB = 25 * 1024 * 1024 bytes
+                    # サイズオーバーの場合はエラーメッセージを返す
+                    return False, f"ファイルサイズが大きすぎます: {file_size / (1024*1024):.1f}MB（上限: 25MB）"
+                
+                # すべてのチェックが通った場合
+                return True, "WAVファイルは有効です"
+                
+        except Exception as e:                       # WAVファイル読み込みエラー
+            return False, f"WAVファイルの読み込みエラー: {e}"
+    
+    def transcribe_english_with_timestamps(self, audio_file):
+        """
+        英語音声をタイムスタンプ付きで認識する
+        OpenAI Whisper APIを使用
+        Args:
+            audio_file: 音声ファイルのパス
+        Returns:
+            dict: 認識結果（テキスト、言語、長さ、セグメント情報）
+        """
+        # APIキーが設定されていない場合はエラー
+        if self.client is None:
+            return "OpenAI APIキーが設定されていません"
+        
+        # WAVファイルの妥当性チェック
+        is_valid, message = self.validate_wav_file(audio_file)  # バリデーション実行
+        if not is_valid:                                        # チェック失敗時
+            return message                                       # エラーメッセージを返す
+        
+        try:
+            # 音声ファイルをバイナリモードで開く
+            with open(audio_file, "rb") as audio:               # 'rb'はバイナリ読み込み
+                # 新しいAPIバージョンと古いバージョンに対応
+                try:
+                    # 新しいAPI（timestamp_granularities対応）を試す
+                    transcript = self.client.audio.transcriptions.create(
+                        model="whisper-1",                      # Whisperモデルを指定
+                        file=audio,                             # 音声ファイル
+                        language="en",                          # 言語を英語に指定
+                        response_format="verbose_json",         # 詳細なJSON形式で結果を取得
+                        timestamp_granularities=["segment"]     # セグメント単位のタイムスタンプ
+                    )
+                except Exception as new_api_error:              # 新しいAPIでエラーの場合
+                    # 古いAPI（timestamp_granularities未対応）にフォールバック
+                    audio.seek(0)                               # ファイルポインタを先頭に戻す
+                    transcript = self.client.audio.transcriptions.create(
+                        model="whisper-1",                      # Whisperモデルを指定
+                        file=audio,                             # 音声ファイル
+                        language="en",                          # 言語を英語に指定
+                        response_format="verbose_json"          # 詳細なJSON形式（タイムスタンプなし）
+                    )
+            
+            # セグメント情報を含む結果を辞書形式で返す
+            result = {
+                'text': transcript.text,                        # 認識されたテキスト全体
+                'language': transcript.language,                # 検出された言語
+                'duration': transcript.duration,                # 音声の長さ（秒）
+                'segments': transcript.segments if hasattr(transcript, 'segments') else []  # セグメント情報
+            }
+            
+            return result                                       # 結果を返す
+        except Exception as e:                                  # その他のエラー
+            return f"英語音声認識エラー: {e}"                   # エラーメッセージを返す
+    
+    def translate_to_japanese(self, english_text, context="subtitle"):
+        """
+        英語テキストを日本語に翻訳する
+        OpenAI GPT-4を使用して字幕に適した自然な翻訳を行う
+        Args:
+            english_text: 翻訳する英語テキスト
+            context: 翻訳の文脈（"subtitle"など）
+        Returns:
+            str: 翻訳された日本語テキスト
+        """
+        # APIキーが設定されていない場合はエラー
+        if self.client is None:
+            return "OpenAI APIキーが設定されていません"
+        
+        try:
+            # 翻訳用プロンプトの設定
+            if context == "subtitle":                           # 字幕翻訳の場合
+                # 字幕専用の詳細なプロンプトを設定
+                system_prompt = """あなたは映像字幕の専門翻訳者です。以下の英語テキストを自然で読みやすい日本語字幕に翻訳してください。
+
+翻訳の際の注意事項：
+- 字幕として読みやすい自然な日本語にする
+- 文脈を考慮し、映像に合う表現を使う
+- 敬語は文脈に応じて適切に使用
+- 専門用語は日本語で一般的な表現を使用
+- 長すぎる文は適切に分割する
+"""
+            else:                                               # その他の翻訳の場合
+                # シンプルなプロンプト
+                system_prompt = "以下の英語テキストを自然な日本語に翻訳してください。"
+            
+            # OpenAI GPT-4 APIを呼び出し
+            response = self.client.chat.completions.create(
+                model="gpt-4",                                  # GPT-4モデルを使用
+                messages=[                                      # メッセージ配列
+                    {"role": "system", "content": system_prompt},  # システムプロンプト（翻訳指示）
+                    {"role": "user", "content": english_text}       # ユーザー入力（翻訳対象テキスト）
+                ],
+                temperature=0.3                                 # 創造性を抑えて一貫した翻訳にする
+            )
+            
+            # 翻訳結果を取得して前後の空白を削除
+            return response.choices[0].message.content.strip()
+        except Exception as e:                                  # エラーが発生した場合
+            return f"翻訳エラー: {e}"                           # エラーメッセージを返す
+    
+    def create_subtitle_segments(self, transcription_result):
+        """
+        音声認識結果から字幕セグメントを作成する
+        各セグメントを英語から日本語に翻訳
+        Args:
+            transcription_result: 音声認識の結果
+        Returns:
+            list: 字幕セグメントのリスト
+        """
+        # エラーメッセージが返ってきた場合はそのまま返す
+        if isinstance(transcription_result, str):
+            return transcription_result
+        
+        # セグメント情報を取得（なければ空のリスト）
+        segments = transcription_result.get('segments', [])
+        
+        if not segments:                                        # セグメント情報がない場合
+            # 全体を1つのセグメントとして処理
+            english_text = transcription_result.get('text', '')  # 全体のテキストを取得
+            japanese_text = self.translate_to_japanese(english_text)  # 翻訳実行
+            return [{                                           # 1つのセグメントとして返す
+                'start': 0,                                     # 開始時間は0秒
+                'end': transcription_result.get('duration', 0), # 終了時間は音声の長さ
+                'english': english_text,                       # 英語テキスト
+                'japanese': japanese_text                       # 日本語テキスト
+            }]
+        
+        # セグメントごとの処理
+        subtitle_segments = []                                  # 結果格納用のリスト
+        for segment in segments:                                # 各セグメントを処理
+            english_text = segment.get('text', '').strip()      # 英語テキストを取得し空白削除
+            if english_text:                                    # テキストがある場合のみ処理
+                japanese_text = self.translate_to_japanese(english_text)  # 翻訳実行
+                subtitle_segments.append({                      # セグメント情報を追加
+                    'start': segment.get('start', 0),           # 開始時間
+                    'end': segment.get('end', 0),               # 終了時間
+                    'english': english_text,                   # 英語テキスト
+                    'japanese': japanese_text                   # 日本語テキスト
+                })
+        
+        return subtitle_segments                                # セグメントリストを返す
+    
+    def format_time_srt(self, seconds):
+        """
+        秒数をSRT形式のタイムスタンプに変換する
+        SRT形式: HH:MM:SS,mmm (例: 00:01:23,456)
+        Args:
+            seconds: 秒数（float）
+        Returns:
+            str: SRT形式のタイムスタンプ
+        """
+        td = timedelta(seconds=seconds)                         # timedelta オブジェクトに変換
+        hours = int(td.total_seconds() // 3600)                 # 時間を計算（3600秒 = 1時間）
+        minutes = int((td.total_seconds() % 3600) // 60)        # 分を計算（60秒 = 1分）
+        secs = int(td.total_seconds() % 60)                     # 秒を計算
+        millisecs = int((td.total_seconds() % 1) * 1000)        # ミリ秒を計算
+        # SRT形式の文字列を返す（HH:MM:SS,mmm）
+        return f"{hours:02d}:{minutes:02d}:{secs:02d},{millisecs:03d}"
+    
+    def generate_srt_content(self, subtitle_segments):
+        """
+        SRT形式の字幕コンテンツを生成する
+        動画プレイヤーで使用可能な標準的な字幕ファイルを作成
+        Args:
+            subtitle_segments: 字幕セグメントのリスト
+        Returns:
+            str: SRT形式の字幕内容
+        """
+        srt_content = ""                                        # 結果格納用の文字列
+        for i, segment in enumerate(subtitle_segments, 1):      # セグメントを1から番号付けして処理
+            start_time = self.format_time_srt(segment['start']) # 開始時間をSRT形式に変換
+            end_time = self.format_time_srt(segment['end'])     # 終了時間をSRT形式に変換
+            
+            # SRT形式に従って字幕を組み立て
+            srt_content += f"{i}\n"                             # 字幕番号
+            srt_content += f"{start_time} --> {end_time}\n"     # タイムスタンプ
+            srt_content += f"{segment['japanese']}\n\n"         # 日本語テキスト + 空行
+        
+        return srt_content                                      # SRT形式の文字列を返す
+    
+    def generate_bilingual_text(self, subtitle_segments):
+        """
+        英日対訳テキストを生成する
+        学習や確認用の読みやすい形式
+        Args:
+            subtitle_segments: 字幕セグメントのリスト
+        Returns:
+            str: 英日対訳テキスト
+        """
+        # ヘッダー部分を作成
+        text_content = "=" * 60 + "\n"                          # 区切り線
+        text_content += "英語音声 → 日本語字幕\n"               # タイトル
+        text_content += f"生成日時: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"  # 現在時刻
+        text_content += "=" * 60 + "\n\n"                       # 区切り線 + 空行
+        
+        # 各セグメントを処理
+        for i, segment in enumerate(subtitle_segments, 1):      # 1から番号付け
+            start_time = self.format_time_display(segment['start'])  # 表示用時間フォーマット
+            end_time = self.format_time_display(segment['end'])      # 表示用時間フォーマット
+            
+            # 対訳形式で内容を組み立て
+            text_content += f"[{i:03d}] {start_time} - {end_time}\n"  # セグメント番号と時間
+            text_content += f"EN: {segment['english']}\n"              # 英語テキスト
+            text_content += f"JA: {segment['japanese']}\n"             # 日本語テキスト
+            text_content += "-" * 40 + "\n\n"                          # 区切り線 + 空行
+        
+        return text_content                                     # 対訳テキストを返す
+    
+    def format_time_display(self, seconds):
+        """
+        表示用のタイムスタンプフォーマット
+        MM:SS 形式（分:秒）でシンプルに表示
+        Args:
+            seconds: 秒数
+        Returns:
+            str: MM:SS形式の時間文字列
+        """
+        minutes = int(seconds // 60)                            # 分を計算
+        secs = int(seconds % 60)                                # 秒を計算
+        return f"{minutes:02d}:{secs:02d}"                      # MM:SS形式で返す
+    
+    def process_wav_file(self, file_path, progress_callback=None):
+        """
+        WAVファイルを処理して字幕を生成する
+        音声認識→翻訳→字幕生成の全工程を実行
+        Args:
+            file_path: WAVファイルのパス
+            progress_callback: 進捗表示用のコールバック関数
+        Returns:
+            dict: 処理結果（セグメント、元テキスト、長さ）
+        """
+        try:
+            # 進捗表示（ステップ1）
+            if progress_callback:
+                progress_callback("WAVファイルを確認中...")
+            
+            # WAVファイルの拡張子チェック
+            if not file_path.lower().endswith('.wav'):          # 拡張子が.wav以外の場合
+                return "WAVファイルのみ対応しています。他の形式は事前にWAVに変換してください。"
+            
+            # 進捗表示（ステップ2）
+            if progress_callback:
+                progress_callback("英語音声を認識中...")
+            
+            # 英語音声認識（タイムスタンプ付き）
+            transcription_result = self.transcribe_english_with_timestamps(file_path)
+            
+            # 音声認識でエラーが発生した場合
+            if isinstance(transcription_result, str):
+                return transcription_result                     # エラーメッセージをそのまま返す
+            
+            # 進捗表示（ステップ3）
+            if progress_callback:
+                progress_callback("日本語に翻訳中...")
+            
+            # 字幕セグメント作成（翻訳含む）
+            subtitle_segments = self.create_subtitle_segments(transcription_result)
+            
+            # 進捗表示（完了）
+            if progress_callback:
+                progress_callback("完了！")
+            
+            # 処理結果を辞書形式で返す
+            return {
+                'segments': subtitle_segments,                  # セグメント情報
+                'original_text': transcription_result.get('text', ''),  # 元の英語テキスト
+                'duration': transcription_result.get('duration', 0)     # 音声の長さ
+            }
+            
+        except Exception as e:                                  # 予期しないエラー
+            return f"処理エラー: {e}"                           # エラーメッセージを返す
+
+class SubtitleGeneratorGUI:
+    """
+    字幕生成ツールのGUIクラス
+    tkinterを使用してユーザーインターフェースを提供
+    """
+    
+    def __init__(self):
+        """
+        GUIクラスの初期化
+        """
+        # インポートが失敗していた場合は処理を中断
+        if not IMPORTS_OK:
+            return
+        
+        # 各種オブジェクトを初期化
+        self.config_manager = ConfigManager()                   # 設定管理オブジェクト
+        self.subtitle_gen = EnglishToJapaneseSubtitle()         # 字幕生成オブジェクト
+        self.current_segments = None                            # 現在の字幕セグメント
+        
+        # GUI作成と設定読み込み
+        self.setup_gui()                                        # GUI要素を作成
+        self.load_saved_settings()                              # 保存済み設定を読み込み
+    
+    def setup_gui(self):
+        """
+        GUIの要素を設定・配置する
+        メインウィンドウ、メニュー、ボタン、テキストエリアなどを作成
+        """
+        # メインウィンドウの作成と設定
+        self.root = tk.Tk()                                     # メインウィンドウを作成
+        self.root.title("英語音声→日本語字幕生成ツール（WAV専用）")  # ウィンドウタイトル
+        self.root.geometry("1000x800")                          # ウィンドウサイズ（幅x高さ）
+        
+        # メニューバーの作成
+        menubar = tk.Menu(self.root)                            # メニューバーオブジェクト作成
+        self.root.config(menu=menubar)                          # メインウィンドウにメニューを設定
+        
+        # ファイルメニューの作成
+        file_menu = tk.Menu(menubar, tearoff=0)                 # ファイルメニュー作成（切り離し不可）
+        menubar.add_cascade(label="ファイル", menu=file_menu)   # メニューバーに追加
+        file_menu.add_command(label="WAVファイルを開く", command=self.open_file)      # メニュー項目追加
+        file_menu.add_separator()                               # 区切り線追加
+        file_menu.add_command(label="SRT字幕を保存", command=self.save_srt)          # メニュー項目追加
+        file_menu.add_command(label="対訳テキストを保存", command=self.save_bilingual_text)  # メニュー項目追加
+        file_menu.add_separator()                               # 区切り線追加
+        file_menu.add_command(label="終了", command=self.root.quit)                  # 終了メニュー
+        
+        # ツールメニューの作成
+        tools_menu = tk.Menu(menubar, tearoff=0)                # ツールメニュー作成
+        menubar.add_cascade(label="ツール", menu=tools_menu)    # メニューバーに追加
+        tools_menu.add_command(label="音声変換ツール情報", command=self.show_conversion_help)  # ヘルプ
+        
+        # 設定メニューの作成
+        settings_menu = tk.Menu(menubar, tearoff=0)             # 設定メニュー作成
+        menubar.add_cascade(label="設定", menu=settings_menu)   # メニューバーに追加
+        settings_menu.add_command(label="API設定", command=self.show_api_settings)   # API設定ダイアログ
+        
+        # メインフレームの作成（全体のコンテナ）
+        main_frame = tk.Frame(self.root)                        # メインフレーム作成
+        main_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)  # 全体に広がるよう配置
+        
+        # API設定フレームの作成
+        api_frame = ttk.LabelFrame(main_frame, text="OpenAI API設定")  # ラベル付きフレーム
+        api_frame.pack(fill=tk.X, pady=(0, 10))                # 横幅いっぱいに配置
+        
+        # APIキー入力欄の作成
+        tk.Label(api_frame, text="APIキー:").pack(side=tk.LEFT, padx=5)  # ラベル
+        self.api_key_var = tk.StringVar()                       # テキスト入力用変数
+        api_entry = tk.Entry(api_frame, textvariable=self.api_key_var, show="*", width=40)  # 入力欄（パスワード形式）
+        api_entry.pack(side=tk.LEFT, padx=5)                    # 左寄せで配置
+        tk.Button(api_frame, text="設定", command=self.set_api_key).pack(side=tk.LEFT, padx=5)  # 設定ボタン
+        self.api_status_label = tk.Label(api_frame, text="未設定", fg="red")  # ステータス表示（初期は赤色）
+        self.api_status_label.pack(side=tk.LEFT, padx=5)        # 左寄せで配置
+        
+        # 操作ボタンフレームの作成
+        button_frame = tk.Frame(main_frame)                     # ボタン配置用フレーム
+        button_frame.pack(fill=tk.X, pady=(0, 10))              # 横幅いっぱいに配置
+        
+        # メイン操作ボタンの作成
+        tk.Button(button_frame, text="🎵 WAVファイルを選択", 
+                 command=self.open_file, width=20, bg="#4CAF50", fg="white", 
+                 font=("", 12, "bold")).pack(side=tk.LEFT, padx=(0, 10))  # ファイル選択ボタン（緑色）
+        tk.Button(button_frame, text="🔧 音声変換ヘルプ", 
+                 command=self.show_conversion_help, width=15, bg="#9C27B0", fg="white").pack(side=tk.LEFT, padx=(0, 10))  # ヘルプボタン（紫色）
+        tk.Button(button_frame, text="🗑️ 結果をクリア", 
+                 command=self.clear_result, width=15).pack(side=tk.LEFT, padx=(0, 10))  # クリアボタン
+        
+        # 保存ボタンフレームの作成
+        save_frame = tk.Frame(button_frame)                     # 保存ボタン専用フレーム
+        save_frame.pack(side=tk.RIGHT)                          # 右寄せで配置
+        tk.Button(save_frame, text="💾 SRT字幕保存", 
+                 command=self.save_srt, width=12, bg="#2196F3", fg="white").pack(side=tk.LEFT, padx=(0, 5))  # SRT保存（青色）
+        tk.Button(save_frame, text="📄 対訳テキスト保存", 
+                 command=self.save_bilingual_text, width=15, bg="#FF9800", fg="white").pack(side=tk.LEFT)  # テキスト保存（橙色）
+        
+        # 注意書きフレームの作成
+        note_frame = tk.Frame(main_frame)                       # 注意書き用フレーム
+        note_frame.pack(fill=tk.X, pady=(0, 10))                # 横幅いっぱいに配置
+        note_label = tk.Label(note_frame, text="📌 このバージョンはWAVファイルのみ対応（FFmpeg不要・軽量版）", 
+                             fg="blue", font=("", 10, "bold"))  # 注意書きテキスト（青色・太字）
+        note_label.pack()                                       # 中央配置
+        
+        # プログレスバー（進捗表示）の作成
+        self.progress_var = tk.StringVar()                      # 進捗メッセージ用変数
+        self.progress_label = tk.Label(main_frame, textvariable=self.progress_var, fg="blue")  # 進捗ラベル（青色）
+        self.progress_label.pack(fill=tk.X, pady=(0, 10))       # 横幅いっぱいに配置
+        
+        # タブ設定（複数の表示方式を切り替え可能）
+        notebook = ttk.Notebook(main_frame)                     # タブコントロール作成
+        notebook.pack(fill=tk.BOTH, expand=True)                # 残りスペースを全て使用
+        
+        # 対訳表示タブの作成
+        bilingual_frame = ttk.Frame(notebook)                   # 対訳用フレーム
+        notebook.add(bilingual_frame, text="📖 英日対訳")       # タブに追加
+        
+        # 対訳表示用テキストエリア
+        self.bilingual_text = scrolledtext.ScrolledText(bilingual_frame, height=25, width=100, 
+                                                       font=("", 11))  # スクロール付きテキストエリア
+        self.bilingual_text.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)  # 全体に広がるよう配置
+        
+        # SRT字幕タブの作成
+        srt_frame = ttk.Frame(notebook)                         # SRT用フレーム
+        notebook.add(srt_frame, text="🎬 SRT字幕")              # タブに追加
+        
+        # SRT表示用テキストエリア
+        self.srt_text = scrolledtext.ScrolledText(srt_frame, height=25, width=100, 
+                                                 font=("Courier", 10))  # 等幅フォントでSRT形式を見やすく
+        self.srt_text.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)  # 全体に広がるよう配置
+        
+        # 日本語のみタブの作成
+        japanese_frame = ttk.Frame(notebook)                    # 日本語専用フレーム
+        notebook.add(japanese_frame, text="🗾 日本語字幕のみ")  # タブに追加
+        
+        # 日本語表示用テキストエリア
+        self.japanese_text = scrolledtext.ScrolledText(japanese_frame, height=25, width=100, 
+                                                      font=("", 12))  # 少し大きめのフォント
+        self.japanese_text.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)  # 全体に広がるよう配置
+        
+        # ステータスバーの作成
+        self.status_var = tk.StringVar()                        # ステータスメッセージ用変数
+        self.status_var.set("OpenAI APIキーを設定してください")  # 初期メッセージ
+        status_bar = tk.Label(self.root, textvariable=self.status_var, 
+                             relief=tk.SUNKEN, anchor=tk.W)      # くぼんだ見た目、左寄せ
+        status_bar.pack(side=tk.BOTTOM, fill=tk.X)              # 下部に横幅いっぱいで配置
+    
+    def show_conversion_help(self):
+        """
+        音声変換ヘルプダイアログを表示する
+        WAVファイル作成方法の詳細な説明を提供
+        """
+        # ヘルプウィンドウを作成
+        help_window = tk.Toplevel(self.root)                    # 新しいウィンドウ
+        help_window.title("音声ファイル変換方法")               # ウィンドウタイトル
+        help_window.geometry("600x500")                         # ウィンドウサイズ
+        help_window.transient(self.root)                        # メインウィンドウに従属
+        
+        # ヘルプテキストの内容
+        help_text = """🔧 音声ファイル変換方法
+
+このツールはWAVファイルのみ対応しています。
+他の形式（MP3, M4A等）は事前にWAVに変換してください。
+
+【無料変換ツール】
+
+1️⃣ Audacity（推奨）
+   • https://www.audacityteam.org/
+   • インポート → エクスポート → WAV選択
+
+2️⃣ VLC Media Player
+   • メディア → 変換/保存
+   • プロファイルでWAVを選択
+
+3️⃣ オンライン変換サイト
+   • https://convertio.co/ja/
+   • https://online-audio-converter.com/ja/
+
+4️⃣ Windows標準（PowerShell）
+   以下のコマンドをコピーして実行：
+
+---コマンド開始---
+Add-Type -AssemblyName System.Windows.Forms
+$openFileDialog = New-Object System.Windows.Forms.OpenFileDialog
+$openFileDialog.Filter = "音声ファイル|*.mp3;*.m4a;*.flac;*.ogg"
+$result = $openFileDialog.ShowDialog()
+if ($result -eq "OK") {
+    $inputFile = $openFileDialog.FileName
+    $outputFile = [System.IO.Path]::GetDirectoryName($inputFile) + "\\" + [System.IO.Path]::GetFileNameWithoutExtension($inputFile) + ".wav"
+    Write-Host "変換中: $inputFile → $outputFile"
+    # ここでffmpegコマンドが必要
+}
+---コマンド終了---
+
+【変換設定推奨値】
+• サンプルレート: 16000Hz または 44100Hz
+• ビット深度: 16bit
+• チャンネル: モノラル（1チャンネル）推奨
+• ファイルサイズ: 25MB以下
+
+【YouTubeから音声抽出】
+• yt-dlp --extract-audio --audio-format wav [URL]
+"""
+        
+        # ヘルプテキストを表示するウィジェット
+        text_widget = scrolledtext.ScrolledText(help_window, font=("", 10))  # スクロール付きテキスト
+        text_widget.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)        # 全体に広がるよう配置
+        text_widget.insert(1.0, help_text)                     # テキストを挿入
+        text_widget.config(state=tk.DISABLED)                  # 読み取り専用にする
+        
+        # 閉じるボタン
+        close_button = tk.Button(help_window, text="閉じる", command=help_window.destroy)
+        close_button.pack(pady=10)                              # 下部に配置
+    
+    def load_saved_settings(self):
+        """
+        保存された設定を読み込む
+        前回入力したAPIキーなどを復元
+        """
+        api_key = self.config_manager.get_api_key()             # 保存されたAPIキーを取得
+        if api_key:                                             # APIキーが保存されている場合
+            self.api_key_var.set(api_key)                       # 入力欄に設定
+            self.set_api_key(show_message=False)                # メッセージ表示なしで設定
+    
+    def set_api_key(self, show_message=True):
+        """
+        APIキーを設定する
+        Args:
+            show_message: 成功/失敗メッセージを表示するかどうか
+        """
+        api_key = self.api_key_var.get().strip()                # 入力されたAPIキーを取得し空白削除
+        if not api_key:                                         # APIキーが空の場合
+            if show_message:                                    # メッセージ表示フラグがTrueの場合
+                messagebox.showwarning("警告", "APIキーを入力してください")  # 警告ダイアログ表示
+            return                                              # 処理を終了
+        
+        # APIキーを設定してテスト
+        success = self.subtitle_gen.set_api_key(api_key)        # APIキー設定を試行
+        if success:                                             # 設定成功の場合
+            self.config_manager.set_api_key(api_key)            # 設定ファイルに保存
+            self.api_status_label.config(text="✓ 設定済み", fg="green")  # ステータスを緑色で更新
+            self.status_var.set("準備完了")                     # ステータスバーを更新
+            if show_message:                                    # メッセージ表示フラグがTrueの場合
+                messagebox.showinfo("成功", "APIキーが正常に設定されました")  # 成功ダイアログ
+        else:                                                   # 設定失敗の場合
+            self.api_status_label.config(text="✗ エラー", fg="red")  # ステータスを赤色で更新
+            self.status_var.set("APIキーエラー")                # ステータスバーを更新
+            if show_message:                                    # メッセージ表示フラグがTrueの場合
+                messagebox.showerror("エラー", "APIキーが無効です")  # エラーダイアログ
+    
+    def show_api_settings(self):
+        """
+        API設定ダイアログを表示する
+        APIキーの取得方法と料金情報を提供
+        """
+        # 設定ダイアログウィンドウを作成
+        dialog = tk.Toplevel(self.root)                         # 新しいダイアログウィンドウ
+        dialog.title("OpenAI API設定")                          # ダイアログタイトル
+        dialog.geometry("500x300")                              # ダイアログサイズ
+        dialog.transient(self.root)                             # メインウィンドウに従属
+        dialog.grab_set()                                       # モーダルダイアログにする
+        
+        # 情報テキスト
+        info_text = """OpenAI APIキーの取得方法：
+
+1. https://platform.openai.com/ にアクセス
+2. アカウントを作成またはログイン
+3. API Keys ページに移動
+4. "Create new secret key" をクリック
+5. 生成されたキーをコピーして下記に入力
+
+料金（目安）：
+- Whisper API: $0.006/分（約0.9円/分）
+- GPT-4翻訳: $0.03/1000トークン（約4.5円/1000文字）
+"""
+        
+        # 情報ラベル
+        tk.Label(dialog, text=info_text, justify=tk.LEFT, font=("", 10)).pack(padx=20, pady=10)
+        
+        # APIキー入力欄
+        key_frame = tk.Frame(dialog)                            # 入力欄用フレーム
+        key_frame.pack(padx=20, pady=10, fill=tk.X)             # 横幅いっぱいに配置
+        
+        tk.Label(key_frame, text="APIキー:").pack(side=tk.LEFT)  # ラベル
+        key_entry = tk.Entry(key_frame, textvariable=self.api_key_var, width=50)  # 入力欄
+        key_entry.pack(side=tk.LEFT, padx=10, fill=tk.X, expand=True)  # 残りスペースを使用
+        
+        # ボタンフレーム
+        button_frame = tk.Frame(dialog)                         # ボタン配置用フレーム
+        button_frame.pack(pady=20)                              # 下部に配置
+        
+        # 設定ボタン（ラムダ式で複数の処理を実行）
+        tk.Button(button_frame, text="設定", 
+                 command=lambda: [self.set_api_key(), dialog.destroy()]).pack(side=tk.LEFT, padx=5)
+        # キャンセルボタン
+        tk.Button(button_frame, text="キャンセル", command=dialog.destroy).pack(side=tk.LEFT, padx=5)
+    
+    def update_progress(self, message):
+        """
+        プログレス表示を更新する
+        Args:
+            message: 表示するメッセージ
+        """
+        self.progress_var.set(message)                          # 進捗メッセージを設定
+        self.root.update()                                      # GUI画面を即座に更新
+    
+    def open_file(self):
+        """
+        WAVファイルを開いて処理する
+        ファイル選択→音声認識→翻訳→結果表示の全工程を実行
+        """
+        # APIキーが設定されているかチェック
+        if self.subtitle_gen.client is None:
+            messagebox.showerror("エラー", "OpenAI APIキーを設定してください")
+            return                                              # 処理を中断
+        
+        # ファイル選択ダイアログを開く
+        file_path = filedialog.askopenfilename(
+            title="英語WAVファイルを選択",                       # ダイアログタイトル
+            filetypes=[                                         # ファイル形式フィルター
+                ("WAVファイル", "*.wav"),                       # WAVファイルのみ
+                ("すべてのファイル", "*.*")                     # 念のため全ファイル
+            ]
+        )
+        
+        if file_path:                                           # ファイルが選択された場合
+            self.status_var.set("処理中...")                   # ステータス更新
+            
+            def process_thread():
+                """
+                音声処理を別スレッドで実行する関数
+                GUIの応答性を保つために別スレッドで重い処理を実行
+                """
+                try:
+                    # 音声ファイル処理を実行
+                    result = self.subtitle_gen.process_wav_file(file_path, self.update_progress)
+                    
+                    if isinstance(result, str):                 # エラーメッセージが返された場合
+                        messagebox.showerror("エラー", result)  # エラーダイアログ表示
+                        self.status_var.set("エラー")           # ステータス更新
+                        return                                  # 処理を終了
+                    
+                    # 成功の場合
+                    self.current_segments = result['segments']  # セグメント情報を保存
+                    self.display_results(result, os.path.basename(file_path))  # 結果を表示
+                    self.status_var.set("処理完了")             # ステータス更新
+                    self.progress_var.set("")                   # 進捗表示をクリア
+                    
+                except Exception as e:                          # 予期しないエラー
+                    messagebox.showerror("エラー", f"処理中にエラーが発生しました: {e}")
+                    self.status_var.set("エラー")               # ステータス更新
+                    self.progress_var.set("")                   # 進捗表示をクリア
+            
+            # 別スレッドで処理を開始（daemon=Trueでメインスレッド終了時に自動終了）
+            threading.Thread(target=process_thread, daemon=True).start()
+    
+    def display_results(self, result, filename):
+        """
+        処理結果を各タブに表示する
+        Args:
+            result: 処理結果の辞書
+            filename: ファイル名
+        """
+        segments = result['segments']                           # セグメント情報を取得
+        
+        # 対訳テキスト表示
+        bilingual_content = self.subtitle_gen.generate_bilingual_text(segments)  # 対訳テキスト生成
+        bilingual_content = f"ファイル: {filename}\n\n" + bilingual_content      # ファイル名を追加
+        self.bilingual_text.delete(1.0, tk.END)                # 既存内容をクリア
+        self.bilingual_text.insert(1.0, bilingual_content)     # 新しい内容を挿入
+        
+        # SRT字幕表示
+        srt_content = self.subtitle_gen.generate_srt_content(segments)  # SRT内容生成
+        self.srt_text.delete(1.0, tk.END)                      # 既存内容をクリア
+        self.srt_text.insert(1.0, srt_content)                 # 新しい内容を挿入
+        
+        # 日本語のみ表示
+        japanese_content = f"ファイル: {filename}\n"           # ヘッダー作成
+        japanese_content += "=" * 50 + "\n\n"                  # 区切り線
+        for i, segment in enumerate(segments, 1):               # 各セグメントを処理
+            japanese_content += f"{i:02d}. {segment['japanese']}\n\n"  # 番号付きで日本語テキスト
+        
+        self.japanese_text.delete(1.0, tk.END)                 # 既存内容をクリア
+        self.japanese_text.insert(1.0, japanese_content)       # 新しい内容を挿入
+    
+    def save_srt(self):
+        """
+        SRT字幕ファイルを保存する
+        動画プレイヤーで使用可能な標準字幕形式で出力
+        """
+        # 保存するデータがあるかチェック
+        if not self.current_segments:
+            messagebox.showwarning("警告", "保存する字幕データがありません")
+            return                                              # 処理を中断
+        
+        # 保存先ファイル選択ダイアログ
+        file_path = filedialog.asksaveasfilename(
+            title="SRT字幕ファイルを保存",                      # ダイアログタイトル
+            defaultextension=".srt",                            # デフォルト拡張子
+            filetypes=[("SRT字幕ファイル", "*.srt"), ("すべてのファイル", "*.*")]  # ファイル形式
+        )
+        
+        if file_path:                                           # 保存先が選択された場合
+            try:
+                # SRT内容を生成
+                srt_content = self.subtitle_gen.generate_srt_content(self.current_segments)
+                # ファイルに書き込み（UTF-8エンコーディング）
+                with open(file_path, 'w', encoding='utf-8') as f:
+                    f.write(srt_content)                        # SRT内容をファイルに書き込み
+                
+                # 成功メッセージ表示
+                messagebox.showinfo("成功", f"SRT字幕ファイルを保存しました:\n{os.path.basename(file_path)}")
+                self.status_var.set(f"SRT保存完了: {os.path.basename(file_path)}")  # ステータス更新
+            except Exception as e:                              # ファイル保存エラー
+                messagebox.showerror("エラー", f"保存中にエラーが発生しました: {e}")
+    
+    def save_bilingual_text(self):
+        """
+        対訳テキストファイルを保存する
+        学習や確認用の読みやすい形式で出力
+        """
+        # 保存するデータがあるかチェック
+        if not self.current_segments:
+            messagebox.showwarning("警告", "保存するテキストデータがありません")
+            return                                              # 処理を中断
+        
+        # 保存先ファイル選択ダイアログ
+        file_path = filedialog.asksaveasfilename(
+            title="対訳テキストファイルを保存",                  # ダイアログタイトル
+            defaultextension=".txt",                            # デフォルト拡張子
+            filetypes=[("テキストファイル", "*.txt"), ("すべてのファイル", "*.*")]  # ファイル形式
+        )
+        
+        if file_path:                                           # 保存先が選択された場合
+            try:
+                # 対訳テキスト内容を生成
+                text_content = self.subtitle_gen.generate_bilingual_text(self.current_segments)
+                # ファイルに書き込み（UTF-8エンコーディング）
+                with open(file_path, 'w', encoding='utf-8') as f:
+                    f.write(text_content)                       # テキスト内容をファイルに書き込み
+                
+                # 成功メッセージ表示
+                messagebox.showinfo("成功", f"対訳テキストファイルを保存しました:\n{os.path.basename(file_path)}")
+                self.status_var.set(f"テキスト保存完了: {os.path.basename(file_path)}")  # ステータス更新
+            except Exception as e:                              # ファイル保存エラー
+                messagebox.showerror("エラー", f"保存中にエラーが発生しました: {e}")
+    
+    def clear_result(self):
+        """
+        表示されている結果をすべてクリアする
+        """
+        self.bilingual_text.delete(1.0, tk.END)                # 対訳テキストをクリア
+        self.srt_text.delete(1.0, tk.END)                      # SRTテキストをクリア
+        self.japanese_text.delete(1.0, tk.END)                 # 日本語テキストをクリア
+        self.current_segments = None                            # セグメント情報をクリア
+        self.progress_var.set("")                               # 進捗表示をクリア
+        self.status_var.set("クリア完了")                       # ステータス更新
+    
+    def run(self):
+        """
+        GUIアプリケーションを開始する
+        メインループを開始してユーザーの操作を待機
+        """
+        self.root.mainloop()                                    # tkinterのメインループを開始
+
+class ConfigManager:
+    """
+    設定ファイルの管理クラス
+    APIキーなどの設定情報を永続化
+    """
+    
+    def __init__(self):
+        """
+        設定管理クラスの初期化
+        """
+        # インポートが失敗していた場合は処理を中断
+        if not IMPORTS_OK:
+            return
+        
+        # 設定ファイルの準備
+        self.config_file = "subtitle_config.ini"               # 設定ファイル名
+        self.config = configparser.ConfigParser()              # 設定パーサーオブジェクト
+        self.load_config()                                      # 既存設定を読み込み
+    
+    def load_config(self):
+        """
+        設定ファイルから設定を読み込む
+        """
+        # 設定ファイルが存在する場合のみ読み込み
+        if os.path.exists(self.config_file):
+            # UTF-8エンコーディングで設定ファイルを読み込み
+            self.config.read(self.config_file, encoding='utf-8')
+    
+    def save_config(self):
+        """
+        現在の設定を設定ファイルに保存する
+        """
+        # UTF-8エンコーディングで設定ファイルに書き込み
+        with open(self.config_file, 'w', encoding='utf-8') as f:
+            self.config.write(f)                                # 設定内容をファイルに書き込み
+    
+    def get_api_key(self):
+        """
+        保存されているAPIキーを取得する
+        Returns:
+            str: 保存されているAPIキー（なければ空文字列）
+        """
+        # 'openai'セクションの'api_key'キーから値を取得（デフォルトは空文字列）
+        return self.config.get('openai', 'api_key', fallback='')
+    
+    def set_api_key(self, api_key):
+        """
+        APIキーを設定ファイルに保存する
+        Args:
+            api_key: 保存するAPIキー
+        """
+        # 'openai'セクションが存在しない場合は作成
+        if 'openai' not in self.config:
+            self.config.add_section('openai')                   # セクションを追加
+        
+        # APIキーを設定
+        self.config.set('openai', 'api_key', api_key)           # キーと値を設定
+        self.save_config()                                      # ファイルに保存
+
+def install_requirements():
+    """
+    必要なライブラリを自動インストールする関数
+    pip コマンドを使用してライブラリをインストール
+    """
+    import subprocess                                           # 外部コマンド実行用
+    import sys                                                  # システム関連
+    
+    # インストールが必要なライブラリのリスト
+    required_packages = [
+        'openai>=1.0.0'                                         # OpenAI APIライブラリ（バージョン1.0.0以上）
+    ]
+    
+    # インストール開始メッセージ
+    print("必要なライブラリをインストール中...")
+    print("=" * 40)                                             # 区切り線
+    
+    # 各パッケージを順番にインストール
+    for package in required_packages:
+        try:
+            print(f"📦 {package} をインストール中...")            # インストール開始メッセージ
+            
+            # pip install コマンドを実行
+            subprocess.check_call([sys.executable, "-m", "pip", "install", package])
+            print(f"✅ {package} インストール完了")               # 成功メッセージ
+        except subprocess.CalledProcessError:                   # インストール失敗時
+            print(f"❌ {package} インストール失敗")               # 失敗メッセージ
+    
+    # インストール完了メッセージ
+    print("\n🎉 インストール完了！")
+    print("📌 このバージョンはWAVファイル専用（超軽量版）")
+    print("次のコマンドでツールを起動してください:")
+    print("py wav_subtitle.py")
+    input("\nEnterキーを押して終了...")                        # ユーザーの入力待ち
+
+def main():
+    """
+    メイン関数 - プログラムのエントリーポイント
+    コマンドライン引数の処理とアプリケーションの起動
+    """
+    # 起動メッセージ
+    print("英語音声→日本語字幕生成ツール（WAV専用・FFmpeg不要版）")
+    print("=" * 70)                                             # 区切り線
+    
+    # インポートエラーのチェック
+    if not IMPORTS_OK:                                          # ライブラリインポートに失敗した場合
+        print("❌ 必要なライブラリがインストールされていません")
+        print(f"エラー: {MISSING_MODULE}")                      # エラー詳細を表示
+        print("\n📦 以下の方法でライブラリをインストールしてください:")
+        print("\n方法1: 自動インストール")
+        print("  py wav_subtitle.py --install")                 # 自動インストールコマンド
+        print("\n方法2: 手動インストール")
+        print("  pip install openai>=1.0.0")                   # 手動インストールコマンド
+        print("\n💡 このバージョンは最軽量（OpenAI APIのみ必要）")
+        input("\nEnterキーを押して終了...")                    # ユーザーの入力待ち
+        return                                                  # プログラム終了
+    
+    # コマンドライン引数のチェック
+    if len(sys.argv) > 1 and sys.argv[1] == "--install":       # --install オプションが指定された場合
+        install_requirements()                                  # ライブラリインストール実行
+        return                                                  # プログラム終了
+    
+    # GUIアプリケーションの起動
+    try:
+        app = SubtitleGeneratorGUI()                            # GUIアプリケーションオブジェクト作成
+        app.run()                                               # アプリケーション実行
+    except Exception as e:                                      # 起動エラー
+        print(f"アプリケーションの起動に失敗しました: {e}")     # エラーメッセージ表示
+        input("Enterキーを押して終了...")                      # ユーザーの入力待ち
+
+# プログラムのエントリーポイント
+if __name__ == "__main__":                                      # スクリプトが直接実行された場合
+    # インポートエラーがある場合でも--installオプションは実行可能
+    if not IMPORTS_OK and len(sys.argv) > 1 and sys.argv[1] == "--install":
+        install_requirements()                                  # インストール実行
+    else:
+        main()                                                  # メイン関数実行
